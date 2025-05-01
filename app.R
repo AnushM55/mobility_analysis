@@ -2,6 +2,9 @@
 # Make sure to install them first if you haven't:
 # install.packages(c("shiny", "dplyr", "ggplot2", "lubridate", "forecast", "DT", "readxl", "tidyr", "hms", "shinythemes", "cluster", "stats", "scales"))
 
+# Enable Shiny auto-reload for development (works in interactive R sessions)
+options(shiny.autoreload = TRUE)
+
 # Check if packages are installed, install if necessary, and load them
 packages <- c("shiny", "dplyr", "ggplot2", "lubridate", "forecast", "DT", "readxl", "tidyr", "hms", "shinythemes", "cluster", "stats", "scales")
 installed_packages <- packages %in% rownames(installed.packages())
@@ -77,7 +80,7 @@ tryCatch({
   # Define search patterns for essential columns
   column_mapping$date <- find_column_name("Date", c("Date"), original_names, cleaned_names_map)
   column_mapping$time <- find_column_name("Time", c("Time"), original_names, cleaned_names_map)
-  column_mapping$status <- find_column_name("Booking Status", c("Booking Status", "Booking_Status", "Status"), original_names, cleaned_names_map)
+  column_mapping$status <- find_column_name("Booking_Status", c("Booking Status", "Booking_Status", "Status"), original_names, cleaned_names_map)
   column_mapping$pickup <- find_column_name("Pickup Location", c("Pickup Location", "Pickup_Location", "Pickup"), original_names, cleaned_names_map)
   column_mapping$value <- find_column_name("Booking Value", c("Booking Value", "Booking_Value", "Value", "Fare"), original_names, cleaned_names_map)
   column_mapping$distance <- find_column_name("Ride Distance", c("Ride Distance", "Ride_Distance", "Distance"), original_names, cleaned_names_map)
@@ -128,6 +131,9 @@ tryCatch({
     return(as_hms(NA))
   }
 
+# Currency conversion rate
+usd_to_inr <- 83
+
 processed_data <- raw_data %>%
   # Ensure the identified time column is treated as character initially for robust parsing
   mutate(!!Time_col_sym := as.character(!!Time_col_sym)) %>%
@@ -143,10 +149,10 @@ processed_data <- raw_data %>%
     Hour = ifelse(!is.na(Time_hms), hour(Time_hms), NA_integer_),
 
     # Determine Status Flags
-    Is_Completed = ifelse(tolower(!!sym(column_mapping$status)) == "completed", 1, 0),
-    Is_Cancelled = ifelse(tolower(!!sym(column_mapping$status)) == "cancelled", 1, 0),
-    # Ensure numeric types
-    Booking.Value = suppressWarnings(as.numeric(!!sym(column_mapping$value))),
+    Is_Completed = ifelse(tolower(!!sym(column_mapping$status)) == "success", 1, 0),
+    Is_Cancelled = ifelse(tolower(!!sym(column_mapping$status)) != "success", 1, 0),
+    # Ensure numeric types and convert Booking.Value from USD to INR
+    Booking.Value = suppressWarnings(as.numeric(!!sym(column_mapping$value))) * usd_to_inr,
     Ride.Distance = suppressWarnings(as.numeric(!!sym(column_mapping$distance))),
     # Ensure location is character/factor
     Pickup.Location = as.character(!!sym(column_mapping$pickup))
@@ -208,7 +214,6 @@ processed_data <- raw_data %>%
 #        is.na(!!Time_col_sym) | trimws(!!Time_col_sym) == "" ~ NA_real_,
 #        
 #        # Handle numeric Excel times (fraction of a day) - check if it *can* be numeric first
-#        # This handles cases where read_excel guessed numeric but it's not 0-1 range
 #        !is.na(suppressWarnings(as.numeric(!!Time_col_sym))) & as.numeric(!!Time_col_sym) >= 0 & as.numeric(!!Time_col_sym) < 1 ~
 #          hms(seconds = round(as.numeric(!!Time_col_sym) * 86400)),
 #        
@@ -332,7 +337,10 @@ ui <- fluidPage(
           condition = "input.tabs == 'demandPrediction'",
           h4("Prediction Settings"),
           numericInput("forecastHorizon", "Forecast Horizon (days):", value = 30, min = 7, max = 365),
-          selectInput("aggPeriod", "Aggregation Period:", choices = c("Daily", "Weekly", "Monthly"), selected = "Daily")
+          selectInput("aggPeriod", "Aggregation Period:", choices = c("Daily", "Weekly"), selected = "Daily"),
+          selectInput("forecastMethod", "Forecasting Method:",
+                      choices = c("Auto (Best)", "Naive", "Mean", "Drift", "Seasonal Naive", "TBATS", "Linear Regression", "Polynomial Regression"),
+                      selected = "Auto (Best)")
         ),
         
         conditionalPanel(
@@ -344,16 +352,19 @@ ui <- fluidPage(
         conditionalPanel(
           condition = "input.tabs == 'locationClustering'",
           h4("Clustering Settings"),
-          numericInput("numClusters", "Number of Clusters (k):", value = 5, min = 2, max = 15, step = 1),
           checkboxGroupInput("clusterFeatures", "Features for Clustering:",
-                             choices = c("Avg. Booking Value" = "Avg_Booking_Value",
-                                         "Avg. Ride Distance" = "Avg_Ride_Distance_km",
-                                         "Cancellation Rate" = "Cancellation_Rate",
-                                         "Total Completed Trips" = "Total_Completed_Trips"
-                                         # Add more numeric features from locationSummary if desired
+                             choices = c(
+                               "Avg. Booking Value" = "Avg_Booking_Value",
+                               "Avg. Ride Distance" = "Avg_Ride_Distance_km",
+                               "Cancellation Rate" = "Cancellation_Rate",
+                               "Total Completed Trips" = "Total_Completed_Trips",
+                               # Add Avg. Driver Rating if available
+                               if ("Driver.Rating" %in% colnames(app_data)) "Avg. Driver Rating" = "Avg_Driver_Rating" else NULL
                              ),
                              selected = c("Avg_Booking_Value", "Avg_Ride_Distance_km", "Cancellation_Rate", "Total_Completed_Trips")),
-          actionButton("runClustering", "Run Clustering")
+          numericInput("kmeans_k", "Number of Clusters (k):", value = 3, min = 2, max = 15, step = 1),
+          actionButton("runClustering", "Run Clustering"),
+          verbatimTextOutput("clusteringDebugInfo", placeholder = TRUE)
         ),
         
         width = 3
@@ -393,6 +404,9 @@ ui <- fluidPage(
                                )
                              ),
                              hr(),
+                             h4("DEBUG: Filtered Hourly Data (first 20 rows)"),
+                             DT::dataTableOutput("debugHourlyTable"),
+                             hr(),
                              h4("Average Booking Value by Hour"),
                              plotOutput("avgValuePlot")
                     ), # End tabPanel demandPricing
@@ -427,21 +441,30 @@ ui <- fluidPage(
                              h4("Grouping Similar Locations"),
                              p("Using K-Means algorithm to group locations based on selected performance characteristics. Requires clicking 'Run Clustering' after changing settings."),
                              hr(),
-                             h4("Cluster Assignments"),
-                             DTOutput("clusterResultsTable"),
-                             hr(),
-                             fluidRow(
-                               column(6,
-                                      h4("Cluster Visualization (PCA)"),
-                                      plotOutput("clusterPlotPCA")
-                               ),
-                               column(6,
-                                      h4("Cluster Profiles (Centroids)"), # Renamed for clarity
-                                      DTOutput("clusterProfileTable")
+                             conditionalPanel(
+                               condition = "input.clusteringMethod == 'kmeans'",
+                               h4("Cluster Assignments (K-means)"),
+                               DTOutput("clusterResultsTable"),
+                               hr(),
+                               fluidRow(
+                                 column(6,
+                                        h4("Cluster Visualization (PCA)"),
+                                        plotOutput("clusterPlotPCA")
+                                 ),
+                                 column(6,
+                                        h4("Cluster Profiles (Centroids)"),
+                                        DTOutput("clusterProfileTable")
+                                 )
                                )
+                             ),
+                             conditionalPanel(
+                               condition = "input.clusteringMethod == 'hclust'",
+                               h4("Dendrogram (Hierarchical Clustering)"),
+                               plotOutput("dendrogramPlot", height = "400px"),
+                               hr(),
+                               h4("Cluster Assignments (Hierarchical)"),
+                               DTOutput("hclustResultsTable")
                              )
-                             # Optional: Add Silhouette plot here for validation
-                             # plotOutput("clusterSilhouettePlot")
                     ) # End tabPanel locationClustering
                     
         ), # End tabsetPanel
@@ -509,6 +532,14 @@ server <- function(input, output, session) {
       mutate(across(where(is.numeric), ~ifelse(is.nan(.x) | is.infinite(.x), NA, .x))) %>% # Replace NaN/Inf with NA first
       mutate(across(where(is.numeric), ~ifelse(is.na(.x), 0, .x))) %>% # Then replace NA with 0 (or choose other imputation)
       arrange(desc(Total_Completed_Trips))
+    
+    # Ensure all columns needed for clustering are present (robust)
+    needed_cols <- c('Pickup.Location', 'Avg_Booking_Value', 'Avg_Ride_Distance_km', 'Cancellation_Rate', 'Total_Completed_Trips')
+    missing_cols <- setdiff(needed_cols, colnames(summary_df))
+    if (length(missing_cols) > 0) {
+      for (col in missing_cols) summary_df[[col]] <- 0
+    }
+    summary_df <- summary_df[, unique(c(needed_cols, colnames(summary_df)))]
     
     # Basic validation
     validate(
@@ -605,27 +636,25 @@ server <- function(input, output, session) {
       scale_x_discrete(limits = factor(input$hourRange[1]:input$hourRange[2]), drop = FALSE)
   })
   
-  output$cancellationRatePlot <- renderPlot({
+  output$debugHourlyTable <- DT::renderDataTable({
+    head(filtered_hourly_data(), 20)
+  })
+
+  output$avgValuePlot <- renderPlot({
     req(filtered_hourly_data(), input$hourRange)
     
     df_agg <- filtered_hourly_data() %>%
       group_by(Hour) %>%
-      summarise(Total_Bookings = n(), Total_Cancelled = sum(Is_Cancelled, na.rm=TRUE), .groups = 'drop') %>%
-      mutate(Cancellation_Rate = ifelse(Total_Bookings > 5, Total_Cancelled / Total_Bookings, NA)) # Min bookings for stable rate
+      summarise(Avg_Booking_Value = mean(Booking.Value, na.rm=TRUE), .groups = 'drop')
     
-    # Complete the data frame to include all hours in the range for plotting
-    all_hours_df <- data.frame(Hour = input$hourRange[1]:input$hourRange[2])
-    df_agg_complete <- left_join(all_hours_df, df_agg, by = "Hour")
-    
-    validate(need(any(!is.na(df_agg_complete$Cancellation_Rate)), "Not enough bookings (>5 per hour) to calculate cancellation rate for any hour in the selected range."))
-    
-    plot_title <- paste("Hourly Cancellation Rate (", input$hourRange[1], ":00 - ", input$hourRange[2], ":59)", sep="")
+    ggplot(df_agg, aes(x=factor(Hour), y=Avg_Booking_Value)) +
+      geom_col(fill="#0073C2FF") +
     
     ggplot(df_agg_complete, aes(x = factor(Hour), y = Cancellation_Rate)) +
       geom_col(fill = "tomato", na.rm = TRUE) + # Use na.rm=TRUE for geom_col if NAs exist
       scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
       labs(title = plot_title,
-           subtitle = "Requires > 5 bookings per hour",
+           subtitle = "Requires at least 1 booking per hour",
            x = "Hour of Day", y = "Cancellation Rate") +
       theme_minimal(base_size = 12) +
       scale_x_discrete(limits = factor(input$hourRange[1]:input$hourRange[2]), drop = FALSE)
@@ -638,7 +667,9 @@ server <- function(input, output, session) {
       filter(!is.na(Booking.Value)) %>% # Ensure we only consider non-NA values
       group_by(Hour) %>%
       summarise(Avg_Booking_Value = mean(Booking.Value, na.rm = TRUE), N = n(), .groups = 'drop') %>%
-      filter(N > 5) # Min bookings for stable average
+      filter(N > 5) %>% # Min bookings for stable average
+      arrange(desc(Avg_Booking_Value)) %>%
+      head(20) # Limit to top 20
     
     validate(need(nrow(df_agg) > 0, "Not enough data (>5 bookings per hour) to calculate average value for any hour in the selected range."))
     
@@ -669,7 +700,7 @@ server <- function(input, output, session) {
     validate(need(nrow(df) > 0, "No data available for the selected filters to perform forecasting."))
     
     # Aggregate data based on selected period - COUNTING bookings
-    agg_unit <- switch(input$aggPeriod, "Daily" = "day", "Weekly" = "week", "Monthly" = "month")
+    agg_unit <- switch(input$aggPeriod, "Daily" = "day", "Weekly" = "week")
     df_agg <- df %>%
       mutate(Time_Period = floor_date(Date, agg_unit)) %>%
       group_by(Time_Period) %>%
@@ -690,8 +721,7 @@ server <- function(input, output, session) {
     # Determine frequency for ts object
     freq <- switch(input$aggPeriod,
                    "Daily" = 7, # Weekly seasonality for daily data
-                   "Weekly" = ifelse(nrow(df_agg) > 104, 52, 1), # Annual seasonality if > 2 years, else none
-                   "Monthly" = 12) # Annual seasonality for monthly data
+                   "Weekly" = ifelse(nrow(df_agg) > 104, 52, 1)) # Annual seasonality if > 2 years, else none
     
     # Validate sufficient data length for the chosen frequency
     validate(need(nrow(df_agg) >= 2 * freq,
@@ -701,13 +731,12 @@ server <- function(input, output, session) {
     # Create ts object
     start_date <- min(df_agg$Time_Period)
     start_param <- switch(input$aggPeriod,
-                          "Daily" = c(year(start_date), yday(start_date)),
-                          "Weekly" = c(year(start_date), as.numeric(format(start_date, "%U")) + 1), # Week starts from 1
-                          "Monthly" = c(year(start_date), month(start_date)))
+                           "Daily" = c(year(start_date), yday(start_date)),
+                           "Weekly" = c(year(start_date), as.numeric(format(start_date, "%U")) + 1)) # Week starts from 1
     
-    ts_data <- ts(df_agg$Total_Bookings,
-                  start = start_param,
-                  frequency = freq)
+    # Use zoo for better date handling on x-axis
+    library(zoo)
+    ts_data <- zoo(df_agg$Total_Bookings, order.by = df_agg$Time_Period)
     
     return(list(ts_data = ts_data, df_agg = df_agg)) # Return both ts object and aggregated data frame
   })
@@ -722,22 +751,135 @@ server <- function(input, output, session) {
     req(input$forecastHorizon)
     
     ts_data <- ts_list$ts_data
-    h_periods <- ceiling(input$forecastHorizon / switch(input$aggPeriod, "Daily"=1, "Weekly"=7, "Monthly"=30.44))
+    h_periods <- ceiling(input$forecastHorizon / switch(input$aggPeriod, "Daily"=1, "Weekly"=7))
     
-    fit <- tryCatch(ets(ts_data),
-                    error = function(e_ets) {
-                      warning(paste("ETS failed:", e_ets$message, "- Trying auto.arima."))
-                      tryCatch(auto.arima(ts_data),
-                               error = function(e_arima) {
-                                 warning(paste("auto.arima also failed:", e_arima$message))
-                                 return(NULL)
-                               })
-                    })
+    # Use user-selected forecasting method
+    model_type <- NULL
+    fc <- NULL
+    fit <- NULL
+    method <- input$forecastMethod
     
-    validate(need(!is.null(fit), "Failed to fit ETS or ARIMA model. Data might be too short, too variable, or unsuitable for these models."))
-    
-    fc <- forecast(fit, h = h_periods)
-    return(list(fit = fit, forecast = fc))
+    if (method == "Naive") {
+      fc <- forecast::naive(ts_data, h = h_periods)
+      model_type <- "Naive"
+      fit <- NULL
+    } else if (method == "Mean") {
+      fc <- forecast::meanf(ts_data, h = h_periods)
+      model_type <- "Mean"
+      fit <- NULL
+    } else if (method == "Drift") {
+      fc <- forecast::rwf(ts_data, h = h_periods, drift = TRUE)
+      model_type <- "Drift"
+      fit <- NULL
+    } else if (method == "Seasonal Naive") {
+      fc <- forecast::snaive(ts_data, h = h_periods)
+      model_type <- "Seasonal Naive"
+      fit <- NULL
+    } else if (method == "Linear Regression") {
+      x <- 1:length(ts_data)
+      y <- as.numeric(ts_data)
+      fit <- lm(y ~ x)
+      future_x <- (length(ts_data) + 1):(length(ts_data) + h_periods)
+      fc_vals <- predict(fit, newdata = data.frame(x = future_x))
+      # Generate future dates
+      last_date <- as.Date(zoo::index(ts_data)[length(ts_data)])
+      by_unit <- ifelse(input$aggPeriod == "Daily", "day", "week")
+      future_dates <- seq(from = last_date + 1, by = by_unit, length.out = h_periods)
+      fc <- list(
+        mean = zoo::zoo(fc_vals, order.by = future_dates),
+        lower = matrix(NA, nrow = h_periods, ncol = 2),
+        upper = matrix(NA, nrow = h_periods, ncol = 2)
+      )
+      model_type <- "Linear Regression"
+      fit <- fit
+    } else if (method == "Polynomial Regression") {
+      x <- 1:length(ts_data)
+      y <- as.numeric(ts_data)
+      fit <- lm(y ~ poly(x, 2))
+      future_x <- (length(ts_data) + 1):(length(ts_data) + h_periods)
+      fc_vals <- predict(fit, newdata = data.frame(x = future_x))
+      last_date <- as.Date(zoo::index(ts_data)[length(ts_data)])
+      by_unit <- ifelse(input$aggPeriod == "Daily", "day", "week")
+      future_dates <- seq(from = last_date + 1, by = by_unit, length.out = h_periods)
+      fc <- list(
+        mean = zoo::zoo(fc_vals, order.by = future_dates),
+        lower = matrix(NA, nrow = h_periods, ncol = 2),
+        upper = matrix(NA, nrow = h_periods, ncol = 2)
+      )
+      model_type <- "Polynomial Regression (Quadratic)"
+      fit <- fit
+    } else if (method == "TBATS") {
+      if (requireNamespace("forecast", quietly = TRUE) && exists("tbats", where = asNamespace("forecast"))) {
+        fit <- forecast::tbats(ts_data)
+        fc <- forecast(fit, h = h_periods)
+        model_type <- "TBATS"
+      } else {
+        # Fallback to naive, but ensure output is a zoo object indexed by correct dates
+        fc_naive <- forecast::naive(ts_data, h = h_periods)
+        last_date <- as.Date(zoo::index(ts_data)[length(ts_data)])
+        by_unit <- ifelse(input$aggPeriod == "Daily", "day", "week")
+        future_dates <- seq(from = last_date + 1, by = by_unit, length.out = h_periods)
+        fc <- list(
+          mean = zoo::zoo(as.numeric(fc_naive$mean), order.by = future_dates),
+          lower = matrix(NA, nrow = h_periods, ncol = 2),
+          upper = matrix(NA, nrow = h_periods, ncol = 2)
+        )
+        model_type <- "Naive (TBATS not available)"
+        fit <- NULL
+      }
+    } else {
+      # Auto (Best)
+      if (length(ts_data) < 8) {
+        # Fallback to naive, but ensure output is a zoo object indexed by correct dates
+        fc_naive <- forecast::naive(ts_data, h = h_periods)
+        last_date <- as.Date(zoo::index(ts_data)[length(ts_data)])
+        by_unit <- ifelse(input$aggPeriod == "Daily", "day", "week")
+        future_dates <- seq(from = last_date + 1, by = by_unit, length.out = h_periods)
+        fc <- list(
+          mean = zoo::zoo(as.numeric(fc_naive$mean), order.by = future_dates),
+          lower = matrix(NA, nrow = h_periods, ncol = 2),
+          upper = matrix(NA, nrow = h_periods, ncol = 2)
+        )
+        model_type <- "Naive (last value)"
+        fit <- NULL
+      } else {
+        # Try STL decomposition + ETS via stlf if enough data
+        if (length(ts_data) >= 2*7) { # At least 2 weeks of data
+          try({
+            fc <- forecast::stlf(ts_data, h = h_periods, method = "ets")
+            model_type <- paste0("STL+ETS (", fc$method, ")")
+            fit <- attr(fc, "model")
+          }, silent = TRUE)
+        }
+        if (is.null(fc)) {
+          # Fallback to ETS/ARIMA
+          fit <- tryCatch(ets(ts_data),
+                          error = function(e_ets) {
+                            warning(paste("ETS failed:", e_ets$message, "- Trying auto.arima."))
+                            tryCatch(auto.arima(ts_data),
+                                     error = function(e_arima) {
+                                       warning(paste("auto.arima also failed:", e_arima$message))
+                                       return(NULL)
+                                     })
+                          })
+          validate(need(!is.null(fit), "Failed to fit ETS or ARIMA model. Data might be too short, too variable, or unsuitable for these models."))
+          fc <- forecast(fit, h = h_periods)
+          # Check if ARIMA/ETS forecast is flat
+          if (all(abs(fc$mean - fc$mean[1]) < 1e-8)) {
+            fc <- forecast::naive(ts_data, h = h_periods)
+            model_type <- "Naive (last value, fallback from flat ARIMA/ETS)"
+            fit <- NULL
+          } else if (inherits(fit, "ets")) {
+            model_type <- paste0("ETS (", fit$method, ")")
+          } else if (inherits(fit, "Arima")) {
+            model_type <- paste0("ARIMA (", fit$arma[1], ",", fit$arma[2], ",", fit$arma[3], ")")
+          } else {
+            model_type <- "Unknown"
+          }
+        }
+      }
+    }
+    return(list(fit = fit, forecast = fc, ts_data = ts_data, model_type = model_type))
   })
   
   output$demandForecastPlot <- renderPlot({
@@ -748,12 +890,37 @@ server <- function(input, output, session) {
     validate(need(!is.null(model_output) && !is.null(model_output$forecast),
                   "Forecasting failed. Unable to generate plot. Check model details and data suitability."))
     
-    p <- ggplot2::autoplot(model_output$forecast) +
+    # Plot historical data and forecast together
+    hist_df <- data.frame(Date = as.Date(zoo::index(model_output$ts_data)),
+                         Bookings = as.numeric(model_output$ts_data))
+    # Defensive: Check for empty or invalid forecast mean or date index
+    forecast_dates <- tryCatch(as.Date(zoo::index(model_output$forecast$mean)), error = function(e) NA)
+    forecast_mean <- tryCatch(as.numeric(model_output$forecast$mean), error = function(e) NA)
+    if (length(forecast_dates) == 0 || all(is.na(forecast_dates)) || length(forecast_mean) == 0 || all(is.na(forecast_mean))) {
+      validate(need(FALSE, "Forecasting failed: forecast output is empty or invalid. Please check your filters and data availability."))
+    }
+    forecast_df <- data.frame(Date = forecast_dates,
+                              Forecast = forecast_mean,
+                              Lo80 = suppressWarnings(as.numeric(model_output$forecast$lower[,1])),
+                              Hi80 = suppressWarnings(as.numeric(model_output$forecast$upper[,1])),
+                              Lo95 = suppressWarnings(as.numeric(model_output$forecast$lower[,2])),
+                              Hi95 = suppressWarnings(as.numeric(model_output$forecast$upper[,2])))
+    
+    library(ggplot2)
+    p <- ggplot() +
+      geom_line(data = hist_df, aes(x = Date, y = Bookings), color = 'black') +
+      geom_line(data = forecast_df, aes(x = Date, y = Forecast), color = 'blue') +
+      geom_ribbon(data = forecast_df, aes(x = Date, ymin = Lo80, ymax = Hi80), fill = 'blue', alpha = 0.2) +
+      geom_ribbon(data = forecast_df, aes(x = Date, ymin = Lo95, ymax = Hi95), fill = 'blue', alpha = 0.1) +
       labs(title = paste("Booking Count Forecast (", input$aggPeriod, ")", sep=""),
-           subtitle = paste("Model:", model_output$forecast$method),
-           x = "Time", y = "Number of Bookings") +
+           subtitle = paste("Model:", model_output$model_type),
+           x = "Date", y = "Number of Bookings") +
       theme_minimal(base_size = 12)
     
+    # Warn if forecast is flat
+    if (sd(forecast_df$Forecast) < 1e-6) {
+      p <- p + ggtitle("Warning: Forecast is flat (model predicts constant value). Consider providing more data.")
+    }
     print(p)
   })
   
@@ -766,6 +933,32 @@ server <- function(input, output, session) {
   
   
   # --- Trip Characteristics Outputs ---
+  output$cancellationRatePlot <- renderPlot({
+    req(filtered_hourly_data(), input$hourRange)
+    
+    df_agg <- filtered_hourly_data() %>%
+      group_by(Hour) %>%
+      summarise(Total_Bookings = n(), Total_Cancelled = sum(Is_Cancelled, na.rm=TRUE), .groups = 'drop') %>%
+      mutate(Cancellation_Rate = ifelse(Total_Bookings >= 1, Total_Cancelled / Total_Bookings, NA)) # Show for any hour with at least 1 booking
+    
+    # Complete the data frame to include all hours in the range for plotting
+    all_hours_df <- data.frame(Hour = input$hourRange[1]:input$hourRange[2])
+    df_agg_complete <- dplyr::left_join(all_hours_df, df_agg, by = "Hour")
+    
+    validate(need(any(!is.na(df_agg_complete$Cancellation_Rate)), "Not enough bookings (at least 1 per hour) to calculate cancellation rate for any hour in the selected range."))
+    
+    plot_title <- paste("Hourly Cancellation Rate (", input$hourRange[1], ":00 - ", input$hourRange[2], ":59)", sep="")
+    
+    ggplot(df_agg_complete, aes(x = factor(Hour), y = Cancellation_Rate)) +
+      geom_col(fill = "tomato", na.rm = TRUE) +
+      scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+      labs(title = plot_title,
+           subtitle = "Requires at least 1 booking per hour",
+           x = "Hour of Day", y = "Cancellation Rate") +
+      theme_minimal(base_size = 12) +
+      scale_x_discrete(limits = factor(input$hourRange[1]:input$hourRange[2]), drop = FALSE)
+  })
+  
   output$avgDistancePlot <- renderPlot({
     req(filtered_data())
     df_plot <- filtered_data() %>%
@@ -805,108 +998,275 @@ server <- function(input, output, session) {
   
   # --- Location Clustering Outputs ---
   
+
+clustering_debug <- reactiveVal("Clustering not yet run.") # Initial message
   clustering_results <- eventReactive(input$runClustering, {
-    req(location_summary(), input$numClusters, input$clusterFeatures)
+    message("--- Clustering event triggered ---")
+    message("clustering_results() function called")
+    clustering_debug("Starting clustering process...") # Update UI debug
+    req(location_summary(), input$clusterFeatures)
     loc_summary <- location_summary()
-    
+    message(paste("Location summary rows:", nrow(loc_summary)))
+    message("location_summary() is valid")
+    message(paste("Number of rows in location_summary():", nrow(loc_summary)))
     features_to_use <- input$clusterFeatures
     available_features <- colnames(loc_summary)
+    message(paste("Selected features:", paste(features_to_use, collapse=", ")))
     valid_features <- intersect(features_to_use, available_features)
-    
-    validate(
-      need(length(valid_features) > 0, "No valid features selected or available for clustering."),
-      need(length(valid_features) >= 2, "Please select at least two features for clustering visualization.")
-    )
-    
-    cluster_data <- loc_summary %>%
-      select(Pickup.Location, all_of(valid_features)) %>%
-      mutate(across(all_of(valid_features), ~ifelse(is.na(.x), 0, .x)))
-    
-    locations <- cluster_data$Pickup.Location
-    cluster_data_scaled <- scale(cluster_data[, valid_features])
-    
-    validate(need(nrow(cluster_data_scaled) >= input$numClusters,
-                  paste("Not enough locations (", nrow(cluster_data_scaled), ") to form", input$numClusters, "clusters.")))
-    
-    set.seed(123)
-    kmeans_result <- tryCatch(kmeans(cluster_data_scaled, centers = input$numClusters, nstart = 25),
-                              error = function(e) {
-                                warning(paste("K-means failed:", e$message))
-                                return(NULL)
-                              })
-    
-    validate(need(!is.null(kmeans_result), "K-means clustering algorithm failed. Check data and number of clusters."))
-    
-    results_df <- loc_summary %>%
-      filter(Pickup.Location %in% locations) %>%
-      mutate(Cluster = factor(kmeans_result$cluster))
-    
-    pca_result <- tryCatch(prcomp(cluster_data_scaled, center = TRUE, scale. = FALSE),
-                           error = function(e) {
-                             warning(paste("PCA failed:", e$message))
-                             return(NULL)
-                           })
-    validate(need(!is.null(pca_result) && ncol(pca_result$x) >= 2, "PCA calculation failed or produced less than 2 components.")) # Check for >=2 PCs
-    
-    pca_data <- data.frame(pca_result$x[, 1:2])
-    colnames(pca_data) <- c("PC1", "PC2")
-    pca_data$Cluster <- factor(kmeans_result$cluster)
-    pca_data$Location <- locations
-    
-    cluster_profiles <- results_df %>%
-      group_by(Cluster) %>%
-      summarise(across(all_of(valid_features), mean, na.rm = TRUE),
-                Num_Locations = n(),
-                .groups = 'drop')
-    
-    
-    return(list(
-      results_table = results_df,
-      pca_data = pca_data,
-      kmeans_result = kmeans_result,
-      cluster_data_scaled = cluster_data_scaled,
-      cluster_profiles = cluster_profiles
-    ))
-  })
-  
+    message(paste("Initial valid features:", paste(valid_features, collapse=", ")))
+    message(paste("Number of valid features:", length(valid_features)))
+
+  # Remove features with all NA or zero variance
+  feature_vars <- sapply(loc_summary[, valid_features, drop=FALSE], function(x) var(as.numeric(x), na.rm=TRUE))
+  zero_var_features <- names(feature_vars)[feature_vars == 0 | is.na(feature_vars)]
+  if (length(zero_var_features) > 0) {
+    valid_features <- setdiff(valid_features, zero_var_features)
+    msg <- paste("Removed features with zero variance or all NA:", paste(zero_var_features, collapse=", "))
+    showNotification(msg, type = 'warning')
+    message(msg)
+  }
+  message(paste("Features after variance check:", paste(valid_features, collapse=", ")))
+
+  if (length(valid_features) < 2) {
+    msg <- "At least two features with variation are required for clustering."
+    showNotification(msg, type = "error")
+    message(msg)
+    clustering_debug(msg) # Update UI debug
+    return(NULL)
+  }
+
+  cluster_data <- loc_summary %>%
+    select(Pickup.Location, all_of(valid_features)) %>%
+    mutate(across(all_of(valid_features), ~as.numeric(.x)))
+  message(paste("Rows in cluster_data before imputation:", nrow(cluster_data)))
+
+  # Impute NA/NaN/Inf in clustering features with median (or 0 if all NA)
+  impute_with_median <- function(x) {
+    if (all(!is.finite(x))) {
+      return(rep(0, length(x)))
+    } else {
+      med <- median(x[is.finite(x)], na.rm = TRUE)
+      x[!is.finite(x)] <- med
+      return(x)
+    }
+  }
+  cluster_data <- cluster_data %>% mutate(across(all_of(valid_features), impute_with_median))
+  message("Imputation with median applied.")
+
+  # Notify if any imputation was needed and filter
+  finite_mask <- apply(cluster_data[, valid_features, drop=FALSE], 1, function(row) all(is.finite(row)))
+  num_removed <- sum(!finite_mask)
+  if (num_removed > 0) {
+     msg <- paste0("Removed ", num_removed, " locations with unresolved NA/NaN/Inf after imputation.")
+     showNotification(msg, type = "warning")
+     message(msg)
+  }
+  cluster_data <- cluster_data[finite_mask, ]
+  message(paste("Rows in cluster_data after imputation/filtering:", nrow(cluster_data)))
+
+  locations <- cluster_data$Pickup.Location
+
+  # Explicitly coerce to numeric matrix
+  cluster_matrix <- tryCatch(
+    as.matrix(sapply(cluster_data[, valid_features, drop=FALSE], as.numeric)),
+    error = function(e) {
+      msg <- paste("Error converting features to numeric matrix:", e$message)
+      showNotification(msg, type = 'error')
+      message(msg)
+      clustering_debug(msg)
+      return(NULL)
+    }
+  )
+  if (is.null(cluster_matrix)) return(NULL)
+  message("Converted data to numeric matrix.")
+
+  if (any(!is.finite(cluster_matrix))) {
+    msg <- 'Still found NA/NaN/Inf in clustering matrix after all cleaning. Aborting.'
+    showNotification(msg, type = 'error')
+    message(msg)
+    clustering_debug(msg)
+    return(NULL)
+  }
+
+  # --- Scaling ---
+  message("Scaling data...")
+  cluster_data_scaled <- tryCatch(
+    scale(cluster_matrix),
+    error = function(e) {
+      msg <- paste("Error scaling data:", e$message)
+      showNotification(msg, type = 'error')
+      message(msg)
+      clustering_debug(msg)
+      return(NULL)
+    }
+  )
+  if (is.null(cluster_data_scaled)) return(NULL)
+  message(paste("Scaling complete. Scaled data dimensions:", paste(dim(cluster_data_scaled), collapse="x")))
+
+  if (nrow(cluster_data_scaled) < 2) {
+    msg <- paste0("Not enough locations (", nrow(cluster_data_scaled), ") to cluster after processing.")
+    showNotification(msg, type = "error")
+    message(msg)
+    clustering_debug(msg)
+    return(NULL)
+  }
+
+  # --- Prepare Debug Info ---
+  debug_lines <- reactiveVal(c(
+    '--- K-means DEBUG ---',
+    paste('Timestamp:', Sys.time()),
+    paste('Input k:', input$kmeans_k),
+    paste('Selected Features:', paste(input$clusterFeatures, collapse=', ')),
+    paste('Valid Features Used:', paste(valid_features, collapse=', ')),
+    paste('Number of Locations (Initial):', nrow(loc_summary)),
+    paste('Number of Locations (After Filtering/Imputation):', nrow(cluster_data)),
+    paste('Number of Locations (Final for Clustering):', nrow(cluster_data_scaled)),
+    paste('Number of Features (Final for Clustering):', ncol(cluster_data_scaled)),
+    'First 5 rows of scaled data:',
+    paste(capture.output(print(head(cluster_data_scaled, 5))), collapse='\n')
+  ))
+
+  # --- Run K-means ---
+  k <- input$kmeans_k
+  if (is.null(k) || !is.numeric(k) || k < 2 || k > nrow(cluster_data_scaled)) {
+    msg <- paste("Invalid number of clusters (k =", k, "). Must be between 2 and", nrow(cluster_data_scaled))
+    showNotification(msg, type = "error")
+    message(msg)
+    debug_lines(c(debug_lines(), "ERROR: Invalid k value."))
+    clustering_debug(paste(debug_lines(), collapse='\n'))
+    return(NULL)
+  }
+  message(paste("Running kmeans with k =", k))
+  set.seed(42) # for reproducibility
+  kmeans_result <- tryCatch(
+    kmeans(cluster_data_scaled, centers = k, nstart = 25), # Added nstart for stability
+    error = function(e) {
+      msg <- paste("K-means failed:", e$message)
+      showNotification(msg, type = "error")
+      message(msg)
+      debug_lines(c(debug_lines(), paste("ERROR:", msg)))
+      clustering_debug(paste(debug_lines(), collapse='\n'))
+      return(NULL)
+    }
+  )
+  if (is.null(kmeans_result)) return(NULL)
+  message("K-means finished successfully.")
+
+  cluster_labels <- kmeans_result$cluster
+  cluster_labels_factor <- as.character(cluster_labels) # Use character for easier joins/display
+
+  # Update debug info
+  cluster_assign_summary <- paste(capture.output(print(table(cluster_labels))), collapse='\n')
+  debug_lines(c(debug_lines(),
+                'K-means successful.',
+                'Cluster assignment summary:',
+                cluster_assign_summary))
+  clustering_debug(paste(debug_lines(), collapse='\n')) # Update UI debug output
+
+  # --- Prepare Results ---
+  message("Preparing results dataframe...")
+  # Ensure locations vector matches the rows used in kmeans (cluster_data_scaled)
+  results_df <- loc_summary %>%
+    filter(Pickup.Location %in% locations) %>% # Filter loc_summary to only include clustered locations
+    mutate(KMeans_Cluster = cluster_labels_factor[match(Pickup.Location, locations)]) # Match uses the filtered locations
+  message("Results dataframe prepared.")
+
+  # --- PCA for Visualization ---
+  message("Running PCA...")
+  pca_result <- tryCatch(
+    prcomp(cluster_data_scaled, center = TRUE, scale. = FALSE),
+    error = function(e) {
+      msg <- paste("PCA failed:", e$message)
+      showNotification(msg, type = "error")
+      message(msg)
+      debug_lines(c(debug_lines(), paste("WARNING: PCA failed -", msg)))
+      clustering_debug(paste(debug_lines(), collapse='\n'))
+      return(NULL) # Allow clustering results even if PCA fails
+    }
+  )
+
+  pca_data <- NULL
+  if (!is.null(pca_result)) {
+    if (ncol(pca_result$x) >= 2) {
+      pca_data <- data.frame(pca_result$x[, 1:2])
+      colnames(pca_data) <- c("PC1", "PC2")
+      pca_data$Cluster <- cluster_labels_factor # Use the same factor as results_df
+      pca_data$Location <- locations # Use the filtered locations
+      message("PCA finished successfully.")
+      debug_lines(c(debug_lines(), "PCA successful."))
+    } else {
+      msg <- "PCA calculation produced less than 2 components. Cannot visualize."
+      showNotification(msg, type = "warning")
+      message(msg)
+      debug_lines(c(debug_lines(), paste("WARNING:", msg)))
+    }
+  }
+  clustering_debug(paste(debug_lines(), collapse='\n')) # Update UI debug again
+
+  # --- Cluster Profiles ---
+  message("Calculating cluster profiles...")
+  cluster_profiles <- results_df %>%
+    group_by(KMeans_Cluster) %>%
+    summarise(across(all_of(valid_features), ~mean(.x, na.rm = TRUE)), # Use the actual features used
+              Num_Locations = n(), .groups = 'drop')
+  message("Cluster profiles calculated.")
+
+  # --- Final Return ---
+  message("Clustering process completed.")
+  clustering_debug(paste(c(debug_lines(), "--- Clustering Complete ---"), collapse='\n')) # Final UI update
+  return(list(
+    results_table = results_df, # Contains only successfully clustered locations
+    pca_data = pca_data,
+    kmeans_result = kmeans_result,
+    cluster_data_scaled = cluster_data_scaled,
+    cluster_profiles = cluster_profiles
+  ))
+})
   output$clusterResultsTable <- renderDT({
     results <- clustering_results()
     req(results$results_table)
     display_table <- results$results_table %>%
-      select(Pickup.Location, Cluster, Total_Completed_Trips, Avg_Booking_Value, Avg_Ride_Distance_km, Cancellation_Rate) %>%
-      arrange(Cluster, desc(Total_Completed_Trips))
+      select(Pickup.Location, KMeans_Cluster, Total_Completed_Trips, Avg_Booking_Value, Avg_Ride_Distance_km, Cancellation_Rate) %>%
+      arrange(KMeans_Cluster, desc(Total_Completed_Trips))
     
     datatable(display_table, options = list(pageLength = 10, scrollX = TRUE), rownames = FALSE) %>%
-      formatCurrency('Avg_Booking_Value', currency = "$", digits = 2) %>%
+      formatCurrency('Avg_Booking_Value', currency = "\u20B9", digits = 2) %>%
       formatPercentage('Cancellation_Rate', digits = 1) %>%
       formatRound('Avg_Ride_Distance_km', digits = 1) %>%
       formatRound('Total_Completed_Trips', digits = 0)
   })
-  
+
   output$clusterPlotPCA <- renderPlot({
     results <- clustering_results()
     req(results$pca_data)
     
     ggplot(results$pca_data, aes(x = PC1, y = PC2, color = Cluster)) +
       geom_point(alpha = 0.7, size = 3) +
-      labs(title = "Location Clusters (PCA Visualization)",
+      labs(title = "Location Clusters (K-means, PCA Visualization)",
            x = "Principal Component 1", y = "Principal Component 2",
-           color = "Cluster") +
+           color = "KMeans Cluster") +
       theme_minimal(base_size = 12) +
       scale_color_brewer(palette = "Set1")
   })
   
+  output$clusteringDebugInfo <- renderText({
+    clustering_debug()
+  })
+
   output$clusterProfileTable <- renderDT({
     results <- clustering_results()
     req(results$cluster_profiles)
     
     datatable(results$cluster_profiles, options = list(pageLength = 10, scrollX = TRUE), rownames = FALSE) %>%
-      formatCurrency(intersect(colnames(results$cluster_profiles), 'Avg_Booking_Value'), currency = "$", digits = 2) %>%
+      formatCurrency(intersect(colnames(results$cluster_profiles), 'Avg_Booking_Value'), currency = "\u20B9", digits = 2) %>%
       formatPercentage(intersect(colnames(results$cluster_profiles), 'Cancellation_Rate'), digits = 1) %>%
       formatRound(intersect(colnames(results$cluster_profiles), 'Avg_Ride_Distance_km'), digits = 1) %>%
       formatRound(intersect(colnames(results$cluster_profiles), c('Total_Completed_Trips', 'Num_Locations')), digits = 0)
   })
   
+  observeEvent(input$runClustering, {
+    message("Run Clustering button clicked!")
+  })
 } # End server function
 
 
